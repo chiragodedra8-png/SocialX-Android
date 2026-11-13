@@ -1,0 +1,4 @@
+-keepattributes Signature
+-keepattributes *Annotation*
+-keep class com.socialx.app.data.** { *; }
+-dontwarn org.jetbrains.annotations.**
