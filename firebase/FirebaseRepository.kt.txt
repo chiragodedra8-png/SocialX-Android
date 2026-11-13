@@ -1,0 +1,907 @@
+package com.socialx.app.data
+
+import android.content.Context
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.ktx.auth
+import com.google.firebase.auth.UserProfileChangeRequest
+import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ktx.firestore
+import com.google.firebase.firestore.Query
+import com.google.firebase.ktx.Firebase
+import com.google.firebase.storage.ktx.storage
+import com.socialx.app.core.AppConfig
+import com.socialx.app.core.Prefs
+import com.socialx.app.core.Utils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import java.io.File
+
+/**
+ * Cloud backend: Firebase Auth + Cloud Firestore + Firebase Storage.
+ *
+ * Enable by setting AppConfig.USE_FIREBASE = true after dropping your own
+ * google-services.json into app/. Firestore/Storage security rules that match
+ * this data model ship in /firebase.
+ */
+class FirebaseRepository(
+    private val prefs: Prefs,
+    private val context: Context,
+    private val notifier: Notifier
+) : SocialRepository {
+
+    private val auth: FirebaseAuth = Firebase.auth
+    private val db: FirebaseFirestore = Firebase.firestore
+    private val users get() = db.collection("users")
+    private val posts get() = db.collection("posts")
+
+    private fun uid(): String = auth.currentUser?.uid ?: prefs.userId ?: ""
+
+    // ---------------------------------------------------------------- auth
+
+    override suspend fun signUp(
+        name: String, username: String, email: String, phone: String,
+        password: String, securityQuestion: String, securityAnswer: String
+    ): Result<User> = withContext(Dispatchers.IO) {
+        try {
+            if (email.isBlank()) return@withContext Result.failure(Exception("Email is required for cloud sign up"))
+            if (!Utils.isValidEmail(email)) return@withContext Result.failure(Exception("Enter a valid email"))
+            if (password.length < 6) return@withContext Result.failure(Exception("Password must be at least 6 characters"))
+            val taken = users.whereEqualTo("username", username.lowercase()).limit(1).get().await()
+            if (!taken.isEmpty) return@withContext Result.failure(Exception("That username is taken"))
+
+            val result = auth.createUserWithEmailAndPassword(email.trim(), password).await()
+            val firebaseUser = result.user ?: return@withContext Result.failure(Exception("Sign up failed"))
+            firebaseUser.updateProfile(UserProfileChangeRequest.Builder().setDisplayName(name).build()).await()
+            val user = User(
+                id = firebaseUser.uid, name = name.trim(), username = username.lowercase(),
+                email = email.trim(), phone = phone.trim(), bio = "", avatar = "", cover = "",
+                createdAt = Utils.now(), isPrivate = false, lastSeen = Utils.now(),
+                securityQuestion = securityQuestion
+            )
+            users.document(user.id).set(userMap(user, securityAnswer)).await()
+            prefs.userId = user.id
+            Result.success(user)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private fun userMap(user: User, answer: String = "") = mapOf(
+        "name" to user.name, "username" to user.username, "email" to user.email,
+        "phone" to user.phone, "bio" to user.bio, "avatar" to user.avatar,
+        "cover" to user.cover, "createdAt" to user.createdAt, "isPrivate" to user.isPrivate,
+        "lastSeen" to Utils.now(), "securityQuestion" to user.securityQuestion,
+        "securityAnswerHash" to if (answer.isBlank()) "" else Utils.sha256(answer.lowercase())
+    )
+
+    override suspend fun login(identifier: String, password: String): Result<User> =
+        withContext(Dispatchers.IO) {
+            try {
+                val email = if (identifier.contains("@")) identifier.trim() else {
+                    val snap = users.whereEqualTo("username", identifier.trim().lowercase()).limit(1).get().await()
+                    snap.documents.firstOrNull()?.getString("email")
+                        ?: return@withContext Result.failure(Exception("No account found"))
+                }
+                val result = auth.signInWithEmailAndPassword(email, password).await()
+                val id = result.user?.uid ?: return@withContext Result.failure(Exception("Login failed"))
+                prefs.userId = id
+                users.document(id).update("lastSeen", Utils.now()).await()
+                Result.success(getUser(id) ?: User(id, "User", "user"))
+            } catch (e: Exception) {
+                Result.failure(Exception(friendly(e)))
+            }
+        }
+
+    private fun friendly(e: Exception): String = when {
+        e.message?.contains("password", true) == true -> "Incorrect password"
+        e.message?.contains("network", true) == true -> "Network error. Check your connection."
+        else -> e.message ?: "Something went wrong"
+    }
+
+    override suspend fun resetPassword(
+        identifier: String, answer: String, newPassword: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val email = if (identifier.contains("@")) identifier.trim() else {
+                val snap = users.whereEqualTo("username", identifier.trim().lowercase()).limit(1).get().await()
+                snap.documents.firstOrNull()?.getString("email")
+                    ?: return@withContext Result.failure(Exception("No account found"))
+            }
+            auth.sendPasswordResetEmail(email).await()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun changePassword(
+        userId: String, oldPassword: String, newPassword: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val user = auth.currentUser ?: return@withContext Result.failure(Exception("Not signed in"))
+            user.updatePassword(newPassword).await()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(Exception("Please sign in again, then retry"))
+        }
+    }
+
+    override suspend fun deleteAccount(userId: String, password: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                users.document(userId).delete().await()
+                auth.currentUser?.delete()?.await()
+                prefs.clearSession()
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun currentUser(): User? = withContext(Dispatchers.IO) {
+        val id = auth.currentUser?.uid ?: prefs.userId ?: return@withContext null
+        getUser(id)
+    }
+
+    override fun logout() {
+        auth.signOut()
+        prefs.clearSession()
+    }
+
+    override fun securityQuestionFor(identifier: String): String? = null
+
+    // ------------------------------------------------------------- profile
+
+    override suspend fun getUser(id: String): User? = withContext(Dispatchers.IO) {
+        try {
+            val doc = users.document(id).get().await()
+            if (!doc.exists()) return@withContext null
+            User(
+                id = id,
+                name = doc.getString("name") ?: "User",
+                username = doc.getString("username") ?: "",
+                email = doc.getString("email") ?: "",
+                phone = doc.getString("phone") ?: "",
+                bio = doc.getString("bio") ?: "",
+                avatar = doc.getString("avatar") ?: "",
+                cover = doc.getString("cover") ?: "",
+                createdAt = doc.getLong("createdAt") ?: 0L,
+                isPrivate = doc.getBoolean("isPrivate") ?: false,
+                lastSeen = doc.getLong("lastSeen") ?: 0L,
+                securityQuestion = doc.getString("securityQuestion") ?: ""
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    override suspend fun updateProfile(
+        userId: String, name: String, bio: String, avatar: String,
+        cover: String, isPrivate: Boolean
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val map = mutableMapOf<String, Any>(
+                "name" to name, "bio" to bio, "isPrivate" to isPrivate
+            )
+            if (avatar.isNotEmpty()) map["avatar"] = avatar
+            if (cover.isNotEmpty()) map["cover"] = cover
+            users.document(userId).update(map).await()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun searchUsers(query: String, viewerId: String): List<PersonCard> =
+        withContext(Dispatchers.IO) {
+            try {
+                val snap = users.orderBy("name").startAt(query).endAt(query + "\uf8ff").limit(20).get().await()
+                snap.documents.filter { it.id != viewerId }.map { doc ->
+                    PersonCard(
+                        User(
+                            id = doc.id,
+                            name = doc.getString("name") ?: "",
+                            username = doc.getString("username") ?: "",
+                            avatar = doc.getString("avatar") ?: "",
+                            bio = doc.getString("bio") ?: "",
+                            lastSeen = doc.getLong("lastSeen") ?: 0L
+                        ),
+                        PersonCard.NONE, 0
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    override suspend fun suggestedPeople(viewerId: String, limit: Int): List<PersonCard> =
+        withContext(Dispatchers.IO) {
+            try {
+                users.limit(limit.toLong() + 1).get().await().documents
+                    .filter { it.id != viewerId }
+                    .take(limit)
+                    .map { doc ->
+                        PersonCard(
+                            User(
+                                id = doc.id,
+                                name = doc.getString("name") ?: "",
+                                username = doc.getString("username") ?: "",
+                                avatar = doc.getString("avatar") ?: "",
+                                bio = doc.getString("bio") ?: "",
+                                lastSeen = doc.getLong("lastSeen") ?: 0L
+                            ),
+                            PersonCard.NONE, 0
+                        )
+                    }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    // --------------------------------------------------------------- posts
+
+    override suspend fun createPost(
+        userId: String, text: String, mediaUri: String, mediaType: String,
+        sharedFromId: String?
+    ): Result<Post> = withContext(Dispatchers.IO) {
+        try {
+            val id = posts.document().id
+            val data = mutableMapOf<String, Any>(
+                "userId" to userId, "text" to text, "mediaUri" to mediaUri,
+                "mediaType" to mediaType, "createdAt" to Utils.now(),
+                "likeCount" to 0, "commentCount" to 0, "shareCount" to 0
+            )
+            if (sharedFromId != null) data["sharedFrom"] = sharedFromId
+            posts.document(id).set(data).await()
+            Result.success(postById(id, userId)!!)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun mapPost(doc: com.google.firebase.firestore.DocumentSnapshot, viewerId: String): Post {
+        val author = getUser(doc.getString("userId") ?: "") ?: User("", "Unknown", "")
+        val liked = try {
+            posts.document(doc.id).collection("likes").document(viewerId).get().await().exists()
+        } catch (e: Exception) {
+            false
+        }
+        return Post(
+            id = doc.id,
+            userId = author.id,
+            authorName = author.name,
+            authorAvatar = author.avatar,
+            text = doc.getString("text") ?: "",
+            mediaUri = doc.getString("mediaUri") ?: "",
+            mediaType = doc.getString("mediaType") ?: "",
+            createdAt = doc.getLong("createdAt") ?: 0L,
+            likeCount = (doc.getLong("likeCount") ?: 0L).toInt(),
+            commentCount = (doc.getLong("commentCount") ?: 0L).toInt(),
+            shareCount = (doc.getLong("shareCount") ?: 0L).toInt(),
+            likedByMe = liked,
+            savedByMe = false
+        )
+    }
+
+    override suspend fun feed(userId: String, offset: Int, limit: Int): List<Post> =
+        withContext(Dispatchers.IO) {
+            try {
+                val snap = posts.orderBy("createdAt", Query.Direction.DESCENDING)
+                    .limit((offset + limit).toLong()).get().await()
+                snap.documents.drop(offset).take(limit).map { mapPost(it, userId) }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    override suspend fun userPosts(
+        targetId: String, viewerId: String, offset: Int, limit: Int
+    ): List<Post> = withContext(Dispatchers.IO) {
+        try {
+            val snap = posts.whereEqualTo("userId", targetId)
+                .orderBy("createdAt", Query.Direction.DESCENDING)
+                .limit((offset + limit).toLong()).get().await()
+            snap.documents.drop(offset).take(limit).map { mapPost(it, viewerId) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun savedPosts(viewerId: String): List<Post> = withContext(Dispatchers.IO) {
+        try {
+            val saved = users.document(viewerId).collection("saves").get().await()
+            saved.documents.mapNotNull { postById(it.id, viewerId) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun postById(postId: String, viewerId: String): Post? =
+        withContext(Dispatchers.IO) {
+            try {
+                val doc = posts.document(postId).get().await()
+                if (!doc.exists()) null else mapPost(doc, viewerId)
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+    override suspend fun toggleLike(postId: String, userId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            val ref = posts.document(postId).collection("likes").document(userId)
+            val exists = ref.get().await().exists()
+            if (exists) {
+                ref.delete().await()
+                posts.document(postId).update("likeCount", FieldValue.increment(-1)).await()
+                false
+            } else {
+                ref.set(mapOf("createdAt" to Utils.now())).await()
+                posts.document(postId).update("likeCount", FieldValue.increment(1)).await()
+                true
+            }
+        }
+
+    override suspend fun addComment(
+        postId: String, userId: String, text: String, parentId: String?
+    ): Result<Comment> = withContext(Dispatchers.IO) {
+        try {
+            val ref = posts.document(postId).collection("comments").document()
+            val data = mutableMapOf<String, Any>(
+                "userId" to userId, "text" to text, "createdAt" to Utils.now()
+            )
+            if (parentId != null) data["parentId"] = parentId
+            ref.set(data).await()
+            posts.document(postId).update("commentCount", FieldValue.increment(1)).await()
+            val author = getUser(userId)
+            Result.success(
+                Comment(ref.id, postId, userId, author?.name ?: "", author?.avatar ?: "", text, Utils.now(), parentId)
+            )
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun comments(postId: String): List<Comment> = withContext(Dispatchers.IO) {
+        try {
+            val snap = posts.document(postId).collection("comments").orderBy("createdAt").get().await()
+            snap.documents.map { doc ->
+                val author = getUser(doc.getString("userId") ?: "")
+                Comment(
+                    id = doc.id,
+                    postId = postId,
+                    userId = doc.getString("userId") ?: "",
+                    authorName = author?.name ?: "User",
+                    authorAvatar = author?.avatar ?: "",
+                    text = doc.getString("text") ?: "",
+                    createdAt = doc.getLong("createdAt") ?: 0L,
+                    parentId = doc.getString("parentId")
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun deletePost(postId: String, userId: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val doc = posts.document(postId).get().await()
+                if (doc.getString("userId") != userId) {
+                    return@withContext Result.failure(Exception("You can only delete your own posts"))
+                }
+                posts.document(postId).delete().await()
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun toggleSave(postId: String, userId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            val ref = users.document(userId).collection("saves").document(postId)
+            val exists = ref.get().await().exists()
+            if (exists) {
+                ref.delete().await()
+                false
+            } else {
+                ref.set(mapOf("createdAt" to Utils.now())).await()
+                true
+            }
+        }
+
+    override suspend fun sharePost(postId: String, userId: String, text: String): Result<Unit> =
+        createPost(userId, text, "", "", postId).map { }
+
+    // ------------------------------------------------------ friends/follows
+
+    override suspend fun sendFriendRequest(fromId: String, toId: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                db.collection("friendships").document().set(
+                    mapOf(
+                        "requester" to fromId, "addressee" to toId,
+                        "status" to "PENDING", "createdAt" to Utils.now()
+                    )
+                ).await()
+                pushNotification(toId, fromId, "friend_request", "sent you a friend request", null)
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun respondRequest(requestId: String, accept: Boolean): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                if (accept) {
+                    db.collection("friendships").document(requestId)
+                        .update("status", "ACCEPTED").await()
+                } else {
+                    db.collection("friendships").document(requestId).delete().await()
+                }
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun removeFriend(a: String, b: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val snap = db.collection("friendships")
+                    .whereIn("requester", listOf(a, b)).get().await()
+                snap.documents.filter {
+                    (it.getString("requester") == a && it.getString("addressee") == b) ||
+                        (it.getString("requester") == b && it.getString("addressee") == a)
+                }.forEach { it.reference.delete().await() }
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    private suspend fun peopleFrom(snap: com.google.firebase.firestore.QuerySnapshot, viewer: String): List<PersonCard> =
+        snap.documents.mapNotNull { doc ->
+            getUser(doc.id)?.let { PersonCard(it, PersonCard.FRIENDS, 0) }
+        }
+
+    override suspend fun friendRequests(userId: String): List<PersonCard> =
+        withContext(Dispatchers.IO) {
+            try {
+                val snap = db.collection("friendships")
+                    .whereEqualTo("addressee", userId).whereEqualTo("status", "PENDING").get().await()
+                snap.documents.mapNotNull { doc ->
+                    doc.getString("requester")?.let { id ->
+                        getUser(id)?.let { PersonCard(it, doc.id, 0) }
+                    }
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    override suspend fun friends(userId: String): List<PersonCard> = withContext(Dispatchers.IO) {
+        try {
+            val asRequester = db.collection("friendships")
+                .whereEqualTo("requester", userId).whereEqualTo("status", "ACCEPTED").get().await()
+            val asAddressee = db.collection("friendships")
+                .whereEqualTo("addressee", userId).whereEqualTo("status", "ACCEPTED").get().await()
+            val ids = asRequester.documents.mapNotNull { it.getString("addressee") } +
+                asAddressee.documents.mapNotNull { it.getString("requester") }
+            ids.mapNotNull { getUser(it)?.let { u -> PersonCard(u, PersonCard.FRIENDS, 0) } }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun followers(userId: String): List<PersonCard> = withContext(Dispatchers.IO) {
+        try {
+            val snap = db.collection("follows").whereEqualTo("following", userId).get().await()
+            snap.documents.mapNotNull { doc ->
+                doc.getString("follower")?.let { id ->
+                    getUser(id)?.let { PersonCard(it, PersonCard.FOLLOWING, 0) }
+                }
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun following(userId: String): List<PersonCard> = withContext(Dispatchers.IO) {
+        try {
+            val snap = db.collection("follows").whereEqualTo("follower", userId).get().await()
+            snap.documents.mapNotNull { doc ->
+                doc.getString("following")?.let { id ->
+                    getUser(id)?.let { PersonCard(it, PersonCard.FOLLOWING, 0) }
+                }
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun toggleFollow(followerId: String, targetId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            val ref = db.collection("follows").document("${followerId}_$targetId")
+            val exists = ref.get().await().exists()
+            if (exists) {
+                ref.delete().await()
+                false
+            } else {
+                ref.set(mapOf("follower" to followerId, "following" to targetId, "createdAt" to Utils.now())).await()
+                pushNotification(targetId, followerId, "follow", "started following you", null)
+                true
+            }
+        }
+
+    // ------------------------------------------------------------- stories
+
+    override suspend fun createStory(
+        userId: String, mediaUri: String, mediaType: String, caption: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val url = uploadMedia(mediaUri, "stories")
+            db.collection("stories").document().set(
+                mapOf(
+                    "userId" to userId, "mediaUrl" to url, "mediaType" to mediaType,
+                    "caption" to caption, "createdAt" to Utils.now(),
+                    "expiresAt" to Utils.now() + AppConfig.STORY_TTL_MS
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun activeStories(viewerId: String): List<Story> = withContext(Dispatchers.IO) {
+        try {
+            val snap = db.collection("stories")
+                .whereGreaterThan("expiresAt", Utils.now())
+                .orderBy("expiresAt").get().await()
+            snap.documents.mapNotNull { doc ->
+                val author = getUser(doc.getString("userId") ?: "") ?: return@mapNotNull null
+                Story(
+                    id = doc.id,
+                    userId = author.id,
+                    userName = author.name,
+                    userAvatar = author.avatar,
+                    mediaUri = doc.getString("mediaUrl") ?: "",
+                    mediaType = doc.getString("mediaType") ?: "image",
+                    caption = doc.getString("caption") ?: "",
+                    createdAt = doc.getLong("createdAt") ?: 0L,
+                    mine = author.id == viewerId
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun myStories(userId: String): List<Story> = activeStories(userId).filter { it.mine }
+
+    override suspend fun markStoryViewed(storyId: String, viewerId: String) {
+        try {
+            db.collection("stories").document(storyId).collection("views")
+                .document(viewerId).set(mapOf("viewedAt" to Utils.now())).await()
+        } catch (ignored: Exception) {
+        }
+    }
+
+    override suspend fun storyViewers(storyId: String): List<User> = withContext(Dispatchers.IO) {
+        try {
+            val snap = db.collection("stories").document(storyId).collection("views").get().await()
+            snap.documents.mapNotNull { getUser(it.id) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    // -------------------------------------------------------------- chat
+
+    override suspend fun conversations(userId: String): List<Chat> = withContext(Dispatchers.IO) {
+        try {
+            val snap = db.collection("conversations").whereArrayContains("members", userId)
+                .orderBy("lastAt", Query.Direction.DESCENDING).get().await()
+            snap.documents.mapNotNull { doc ->
+                val members = doc.get("members") as? List<*> ?: return@mapNotNull null
+                val otherId = members.filterIsInstance<String>().firstOrNull { it != userId }
+                    ?: return@mapNotNull null
+                val other = getUser(otherId) ?: return@mapNotNull null
+                Chat(
+                    conversationId = doc.id,
+                    other = other,
+                    lastText = doc.getString("lastText") ?: "Say hi",
+                    lastAt = doc.getLong("lastAt") ?: 0L,
+                    unread = (doc.getLong("unread_$userId") ?: 0L).toInt()
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun openConversation(userId: String, otherId: String): String =
+        withContext(Dispatchers.IO) {
+            val existing = db.collection("conversations")
+                .whereArrayContains("members", userId).get().await()
+            val found = existing.documents.firstOrNull { doc ->
+                (doc.get("members") as? List<*>)?.filterIsInstance<String>()?.contains(otherId) == true
+            }
+            found?.id ?: run {
+                val ref = db.collection("conversations").document()
+                ref.set(
+                    mapOf(
+                        "members" to listOf(userId, otherId), "lastAt" to Utils.now(),
+                        "lastText" to "Say hi"
+                    )
+                ).await()
+                ref.id
+            }
+        }
+
+    override suspend fun otherParticipant(conversationId: String, viewerId: String): User? =
+        withContext(Dispatchers.IO) {
+            try {
+                val doc = db.collection("conversations").document(conversationId).get().await()
+                val members = doc.get("members") as? List<*> ?: return@withContext null
+                members.filterIsInstance<String>().firstOrNull { it != viewerId }?.let { getUser(it) }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+    override suspend fun messages(conversationId: String, viewerId: String): List<Message> =
+        withContext(Dispatchers.IO) {
+            try {
+                val snap = db.collection("conversations").document(conversationId)
+                    .collection("messages").orderBy("createdAt").limit(300).get().await()
+                snap.documents.map { doc ->
+                    Message(
+                        id = doc.id,
+                        conversationId = conversationId,
+                        senderId = doc.getString("senderId") ?: "",
+                        text = doc.getString("text") ?: "",
+                        mediaUri = doc.getString("mediaUrl") ?: "",
+                        mediaType = doc.getString("mediaType") ?: "",
+                        createdAt = doc.getLong("createdAt") ?: 0L,
+                        readAt = doc.getLong("readAt") ?: 0L,
+                        deleted = doc.getBoolean("deleted") ?: false,
+                        mine = doc.getString("senderId") == viewerId
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    override suspend fun sendMessage(
+        conversationId: String, senderId: String, text: String,
+        mediaUri: String, mediaType: String
+    ): Result<Message> = withContext(Dispatchers.IO) {
+        try {
+            val url = if (mediaUri.isNotEmpty()) uploadMedia(mediaUri, "chat") else ""
+            val ref = db.collection("conversations").document(conversationId)
+                .collection("messages").document()
+            val now = Utils.now()
+            ref.set(
+                mapOf(
+                    "senderId" to senderId, "text" to text, "mediaUrl" to url,
+                    "mediaType" to mediaType, "createdAt" to now, "readAt" to 0L, "deleted" to false
+                )
+            ).await()
+            db.collection("conversations").document(conversationId).update(
+                mapOf("lastAt" to now, "lastText" to text.ifBlank { "Photo" })
+            ).await()
+            val other = otherParticipant(conversationId, senderId)
+            if (other != null) {
+                pushNotification(other.id, senderId, "message", text.ifBlank { "sent you a photo" }, null)
+            }
+            Result.success(Message(ref.id, conversationId, senderId, text, url, mediaType, now, 0, false, true))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun markConversationRead(conversationId: String, viewerId: String) {
+        try {
+            val snap = db.collection("conversations").document(conversationId)
+                .collection("messages").whereEqualTo("readAt", 0L).get().await()
+            snap.documents.filter { it.getString("senderId") != viewerId }.forEach {
+                it.reference.update("readAt", Utils.now()).await()
+            }
+        } catch (ignored: Exception) {
+        }
+    }
+
+    override suspend fun deleteMessage(messageId: String, userId: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val convs = db.collection("conversations").whereArrayContains("members", userId).get().await()
+                for (conv in convs.documents) {
+                    val msg = conv.reference.collection("messages").document(messageId).get().await()
+                    if (msg.exists() && msg.getString("senderId") == userId) {
+                        msg.reference.update(
+                            mapOf("deleted" to true, "text" to "", "mediaUrl" to "")
+                        ).await()
+                        return@withContext Result.success(Unit)
+                    }
+                }
+                Result.failure(Exception("Message not found"))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun setTyping(userId: String, conversationId: String, typing: Boolean) {
+        try {
+            db.collection("conversations").document(conversationId)
+                .collection("typing").document(userId)
+                .set(mapOf("at" to if (typing) Utils.now() else 0L)).await()
+        } catch (ignored: Exception) {
+        }
+    }
+
+    override suspend fun isTyping(conversationId: String, otherId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                val doc = db.collection("conversations").document(conversationId)
+                    .collection("typing").document(otherId).get().await()
+                val at = doc.getLong("at") ?: 0L
+                at > 0 && Utils.now() - at < 5000
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+    // ------------------------------------------------------ notifications
+
+    override suspend fun notifications(userId: String): List<AppNotification> =
+        withContext(Dispatchers.IO) {
+            try {
+                val snap = db.collection("notifications").whereEqualTo("userId", userId)
+                    .orderBy("createdAt", Query.Direction.DESCENDING).limit(100).get().await()
+                snap.documents.mapNotNull { doc ->
+                    val actor = getUser(doc.getString("actorId") ?: "") ?: return@mapNotNull null
+                    AppNotification(
+                        id = doc.id,
+                        type = doc.getString("type") ?: "",
+                        actorId = actor.id,
+                        actorName = actor.name,
+                        actorAvatar = actor.avatar,
+                        text = doc.getString("text") ?: "",
+                        postId = doc.getString("postId"),
+                        createdAt = doc.getLong("createdAt") ?: 0L,
+                        isRead = doc.getBoolean("read") ?: false
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    override suspend fun markNotificationsRead(userId: String) {
+        try {
+            val snap = db.collection("notifications")
+                .whereEqualTo("userId", userId).whereEqualTo("read", false).get().await()
+            snap.documents.forEach { it.reference.update("read", true).await() }
+        } catch (ignored: Exception) {
+        }
+    }
+
+    override suspend fun unreadNotificationCount(userId: String): Int = withContext(Dispatchers.IO) {
+        try {
+            db.collection("notifications").whereEqualTo("userId", userId)
+                .whereEqualTo("read", false).get().await().size()
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    override suspend fun unreadMessageCount(userId: String): Int = withContext(Dispatchers.IO) {
+        conversations(userId).sumOf { it.unread }
+    }
+
+    private suspend fun pushNotification(
+        userId: String, actorId: String, type: String, text: String, postId: String?
+    ) {
+        try {
+            val data = mutableMapOf<String, Any>(
+                "userId" to userId, "actorId" to actorId, "type" to type,
+                "text" to text, "createdAt" to Utils.now(), "read" to false
+            )
+            if (postId != null) data["postId"] = postId
+            db.collection("notifications").document().set(data).await()
+            if (type != "message") {
+                notifier.show((System.currentTimeMillis() % 100000).toInt(), "SocialX", text)
+            }
+        } catch (ignored: Exception) {
+        }
+    }
+
+    // --------------------------------------------------------- moderation
+
+    override suspend fun blockUser(blockerId: String, blockedId: String) {
+        try {
+            db.collection("blocks").document("${blockerId}_$blockedId")
+                .set(mapOf("blocker" to blockerId, "blocked" to blockedId, "createdAt" to Utils.now())).await()
+        } catch (ignored: Exception) {
+        }
+    }
+
+    override suspend fun unblockUser(blockerId: String, blockedId: String) {
+        try {
+            db.collection("blocks").document("${blockerId}_$blockedId").delete().await()
+        } catch (ignored: Exception) {
+        }
+    }
+
+    override suspend fun blockedUsers(userId: String): List<User> = withContext(Dispatchers.IO) {
+        try {
+            db.collection("blocks").whereEqualTo("blocker", userId).get().await()
+                .documents.mapNotNull { doc -> doc.getString("blocked")?.let { getUser(it) } }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun report(
+        reporterId: String, targetType: String, targetId: String, reason: String
+    ) {
+        try {
+            db.collection("reports").document().set(
+                mapOf(
+                    "reporter" to reporterId, "targetType" to targetType,
+                    "targetId" to targetId, "reason" to reason, "createdAt" to Utils.now()
+                )
+            ).await()
+        } catch (ignored: Exception) {
+        }
+    }
+
+    // ---------------------------------------------------------- discovery
+
+    override suspend fun searchPosts(query: String, viewerId: String): List<Post> =
+        withContext(Dispatchers.IO) {
+            try {
+                posts.orderBy("createdAt", Query.Direction.DESCENDING).limit(200).get().await()
+                    .documents.filter { (it.getString("text") ?: "").contains(query, true) }
+                    .take(30).map { mapPost(it, viewerId) }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    override suspend fun trendingTags(): List<TrendingTag> = withContext(Dispatchers.IO) {
+        try {
+            val snap = posts.orderBy("createdAt", Query.Direction.DESCENDING).limit(200).get().await()
+            val counts = mutableMapOf<String, Int>()
+            val regex = Regex("#(\\w+)")
+            snap.documents.forEach { doc ->
+                regex.findAll(doc.getString("text") ?: "").forEach {
+                    val tag = it.groupValues[1].lowercase()
+                    counts[tag] = (counts[tag] ?: 0) + 1
+                }
+            }
+            counts.entries.sortedByDescending { it.value }.take(10).map { TrendingTag(it.key, it.value) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun seedDemoContent(userId: String): Result<Unit> =
+        Result.failure(Exception("Demo seeding is only available in local mode"))
+
+    // ------------------------------------------------------------- helpers
+
+    private suspend fun uploadMedia(localPath: String, folder: String): String {
+        if (localPath.isBlank() || localPath.startsWith("http")) return localPath
+        val file = File(localPath)
+        if (!file.exists()) return ""
+        val ref = Firebase.storage.reference.child("$folder/${Utils.newId()}_${file.name}")
+        ref.putFile(android.net.Uri.fromFile(file)).await()
+        return ref.downloadUrl.await().toString()
+    }
+}
