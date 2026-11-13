@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SocialX</string>
+    <string name="tagline">Connect. Share. Belong.</string>
+    <string name="login">Log in</string>
+    <string name="signup">Create account</string>
+    <string name="email">Email</string>
+    <string name="phone">Phone number</string>
+    <string name="password">Password</string>
+    <string name="forgot_password">Forgot password?</string>
+    <string name="home">Home</string>
+    <string name="friends">Friends</string>
+    <string name="chats">Chats</string>
+    <string name="alerts">Alerts</string>
+    <string name="profile">Profile</string>
+    <string name="search_hint">Search people, posts, #tags</string>
+</resources>

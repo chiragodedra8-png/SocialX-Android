@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand_blue">#1877F2</color>
+    <color name="brand_blue_dark">#0B5ED7</color>
+    <color name="brand_blue_light">#E7F0FE</color>
+    <color name="brand_blue_soft">#DCE9FD</color>
+    <color name="white">#FFFFFF</color>
+    <color name="black">#000000</color>
+    <color name="surface_bg">#F2F4F7</color>
+    <color name="card_bg">#FFFFFF</color>
+    <color name="text_primary">#101828</color>
+    <color name="text_secondary">#667085</color>
+    <color name="text_tertiary">#98A2B3</color>
+    <color name="divider">#E4E7EC</color>
+    <color name="chip_bg">#F2F4F7</color>
+    <color name="bubble_me">#1877F2</color>
+    <color name="bubble_other">#F2F4F7</color>
+    <color name="like_red">#E0245E</color>
+    <color name="online_green">#12B76A</color>
+    <color name="danger">#D92D20</color>
+    <color name="overlay">#99000000</color>
+    <color name="skeleton">#EAECF0</color>
+    <color name="ic_launcher_background">#1877F2</color>
+</resources>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand_blue">#3B8BF5</color>
+    <color name="brand_blue_dark">#1877F2</color>
+    <color name="brand_blue_light">#16283F</color>
+    <color name="brand_blue_soft">#1B2E47</color>
+    <color name="surface_bg">#0B0F14</color>
+    <color name="card_bg">#151A21</color>
+    <color name="text_primary">#F2F4F7</color>
+    <color name="text_secondary">#98A2B3</color>
+    <color name="text_tertiary">#667085</color>
+    <color name="divider">#232A33</color>
+    <color name="chip_bg">#1C222B</color>
+    <color name="bubble_me">#1877F2</color>
+    <color name="bubble_other">#1C222B</color>
+    <color name="like_red">#FF4D7D</color>
+    <color name="online_green">#32D583</color>
+    <color name="danger">#F97066</color>
+    <color name="skeleton">#1C222B</color>
+</resources>
